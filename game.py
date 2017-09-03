@@ -89,15 +89,8 @@ GAME_JOIN_LOCATION = "panels1"
 
 
 class PlayerInfo:
-    # How long, in milliseconds, the player needs to hold the button to quit the game
-    QUIT_TIME = 1500
-
     def __init__(self, badge_id, subscriptions=None):
         self.badge_id = badge_id
-
-        # The last timestamp of the start button press
-        # Used to check if the start button is ever held for more than QUIT_TIME seconds
-        self.start_press_at = 0
 
         # The index of the currently selected light
         self.selected_light = 0
@@ -154,19 +147,6 @@ class PlayerInfo:
         # Sets the currently selected light to its previous state
         cur = self.light_settings[self.selected_light]
         self.light_settings[self.selected_light] = self._prev_color(cur)
-
-    def on_start_press(self, timestamp):
-        self.start_press_at = timestamp
-
-    def start_held(self, timestamp):
-        """
-        Returns whether or not the given timestamp is more than QUIT_TIME after the last time the
-        start button was pressed.
-        :param timestamp: The timestamp to check
-        :return: True if timestamp is more than QUIT_TIME after the last start press
-        """
-
-        return timestamp - self.start_press_at > PlayerInfo.QUIT_TIME
 
 
 class GameComponent(ApplicationSession):
@@ -226,10 +206,7 @@ class GameComponent(ApplicationSession):
             print("Unknown player:", badge_id)
             return
 
-        # Remove the player from the game if they hold down the start button for a bit
-        if button == Button.START:
-            if player.start_held(timestamp):
-                await self.kick(badge_id)
+        # Do something with button released here
 
     async def set_lights(self, player):
         # Set the lights for the badge to simple colors
@@ -265,20 +242,9 @@ class GameComponent(ApplicationSession):
         elif button == Button.B:
             player.dimmer()
         elif button == Button.SELECT:
-            self.publish('badge.' + str(badge_id) + '.text', 'You pressed select! Wow!')
-        elif button == Button.START:
-            player.on_start_press(timestamp)
+            self.publish('badge.' + str(badge_id) + '.text', 0, 0, 'You pressed select! Wow!', style=1)
 
         await self.set_lights(player)
-
-    async def kick(self, badge_id):
-        """
-        Removes a player from the game and informs the server that they have left.
-        :param badge_id:
-        :return:
-        """
-
-        self.publish('game.kick', game_id=GAME_ID, badge_id=badge_id)
 
     async def on_player_join(self, badge_id):
         """
@@ -292,15 +258,18 @@ class GameComponent(ApplicationSession):
 
         # Listen for button presses and releases
         press_sub = await self.subscribe(self.on_button_press, 'badge.' + str(badge_id) + '.button.press')
-        release_sub = await self.subscribe(self.on_button_release, 'badge.' + str(badge_id) + '.button.release')
+
+        # If you want to listen for button releases too, un-comment this and add release_sub to
+        # the list of subscriptions below
+        #release_sub = await self.subscribe(self.on_button_release, 'badge.' + str(badge_id) + '.button.release')
 
         # Add an entry to keep track of the player's game-state
-        self.players[badge_id] = PlayerInfo(badge_id, subscriptions=[press_sub, release_sub])
+        self.players[badge_id] = PlayerInfo(badge_id, subscriptions=[press_sub])
 
         await self.set_lights(self.players[badge_id])
 
         # Give the supporters a nice message on their screen
-        self.publish('badge.' + str(badge_id) + '.text', "wow such screen. very support. much thank")
+        self.publish('badge.' + str(badge_id) + '.text', 0, 24, "THANK YOU for supporting us!", style=1)
 
     async def on_player_leave(self, badge_id):
         """
