@@ -5,8 +5,11 @@ A simple demonstration game for the MAGLabs 2017 Swadge.
 
 from autobahn.asyncio.wamp import ApplicationSession, ApplicationRunner
 from autobahn.wamp import auth
+import functools
 import asyncio
+import aiohttp
 import time
+import json
 
 
 class Button:
@@ -62,14 +65,14 @@ WAMP_PASSWORD = "hunter2"
 
 # This is a unique name for this game
 # Change this before you run it, otherwise it will conflict!
-GAME_ID = "demo_game"
+GAME_ID = "h2ops"
 
 # This is a unique button sequence a swadge can enter to join this game.
 # This can be changed at any time, as long as the new value is unique.
 # Setting this to the empty string will disable joining by sequence.
 # Maximum length is 12; 6 is recommended.
 # Buttons are [u]p, [l]eft, [d]own, [r]ight, s[e]lect, [s]tart, [a], [b]
-GAME_JOIN_SEQUENCE = "uuddlrlrbaes"
+GAME_JOIN_SEQUENCE = "udududlrlrlr"
 
 # This is the name of a location that will cause a swadge to automatically
 # join the game without needing to press any buttons. They will also leave
@@ -85,72 +88,264 @@ GAME_JOIN_SEQUENCE = "uuddlrlrbaes"
 # - panels1
 # - gameroom
 # - concerts
-GAME_JOIN_LOCATION = "panels1"
+GAME_JOIN_LOCATION = ""
+
+SETTINGS = {}
 
 
-class PlayerInfo:
-    def __init__(self, badge_id, subscriptions=None):
+class Sender:
+    @classmethod
+    async def send_message(cls, location, msg):
+        with aiohttp.ClientSession() as client:
+            headers = {
+                'content-type': 'application-json'
+            }
+
+            payload = {
+                "text": f"*{location}*: {msg}",
+            }
+
+            # FIXME put the spam back in
+            return
+
+            async with client.request(
+                'post',
+                SETTINGS['webhook_url'],
+                data=json.dumps(payload),
+                headers=headers,
+            ) as request:
+                res = await request.text()
+
+
+class ButtonAction:
+    def __init__(self, message, flag_after=1, message_after=1, cooldown_time=0, hold_time=0):
+        self.message = message
+
+        #: Number of clicks before flag is set
+        self.flag_after = flag_after
+
+        #: Number of clicks before message is sent
+        self.message_after = message_after
+
+        #: Time after a click before another can be registered
+        self.cooldown_time = cooldown_time
+
+        #: Time button must be held down before a click is registered
+        self.hold_time = hold_time
+
+    def get_config(self):
+        return {
+            "message": self.message,
+            "flag_after": self.flag_after,
+            "message_after": self.message_after,
+            "cooldown_time": self.cooldown_time,
+            "hold_time": self.hold_time,
+        }
+
+
+class Station:
+    def __init__(self, name):
+        self.name = name
+
+        #: List[PlayerInfo]
+        self.swadges = []
+
+        # A map of the buttons to its action
+        self.button_actions = {
+            Button.UP: ButtonAction('Up Pressed'),
+            Button.DOWN: ButtonAction('Down Pressed', hold_time=800)
+        }
+
+    def get_config(self):
+        return {
+            "name": self.name,
+            "actions": {
+                button: action.get_config() if action else None
+                for button, action in self.button_actions.items()
+            },
+            "badges": {
+                str(badge.badge_id): badge for badge in self.swadges
+            }
+        }
+
+
+class SwadgeInfo:
+    def __init__(self, badge_id, station=None, subscriptions=None, component=None):
         self.badge_id = badge_id
 
-        # The index of the currently selected light
-        self.selected_light = 0
+        # The station of this button
+        self.station = station
 
-        # The brightness level of each light. The lights are suuuper bright, and having them set
-        # all the way up for long periods of time will drain the batteries and blind everyone
-        self.brightness = .1
+        #: The WAMP component
+        self.component = component
 
-        # Keep track of what the lights are set to
-        self.light_settings = [Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE]
+        self.button_downs = {
+            Button.UP: 0,
+            Button.DOWN: 0,
+            Button.LEFT: 0,
+            Button.RIGHT: 0,
+            Button.SELECT: 0,
+            Button.START: 0,
+            Button.A: 0,
+            Button.B: 0,
+        }
+
+        self.button_ups = {
+            Button.UP: 0,
+            Button.DOWN: 0,
+            Button.LEFT: 0,
+            Button.RIGHT: 0,
+            Button.SELECT: 0,
+            Button.START: 0,
+            Button.A: 0,
+            Button.B: 0,
+        }
+
+        self.button_counts = {
+            Button.UP: 0,
+            Button.DOWN: 0,
+            Button.LEFT: 0,
+            Button.RIGHT: 0,
+            Button.SELECT: 0,
+            Button.START: 0,
+            Button.A: 0,
+            Button.B: 0,
+        }
+
+        self.flags = []
 
         # Subscriptions that have been made for the player
         # Needed so we can unsubscribe later
         self.subscriptions = subscriptions or []
 
-    def brighter(self):
-        # Increase the brightness by 10%
-        self.brightness = min(max(self.brightness + .1, 0.0), 1.0)
+    def get_config(self):
+        return {
+            "badge_id": self.badge_id,
+            "station": self.station,
+            "button_counts": self.button_counts,
+            "flags": self.flags,
+            "battery": 100,
+        }
 
-    def dimmer(self):
-        # Decrease the brightness by 10%
-        self.brightness = min(max(self.brightness - .1, 0.0), 1.0)
+    async def do_progress_lights(self, button):
+        if not self.station:
+            print("no station")
+            return
 
-    def next_light(self):
-        # Select the next light
-        self.selected_light = (self.selected_light + 1) % len(self.light_settings)
+        action = self.station.button_actions.get(button)
 
-    def prev_light(self):
-        # Select the previous light
-        self.selected_light = (self.selected_light - 1) % len(self.light_settings)
+        if not action:
+            print("no action")
+            return
 
-    def _next_color(self, color):
-        # Compute the next color in the rainbow
-        try:
-            index = Color.RAINBOW.index(color)
-            return Color.RAINBOW[(index + 1) % len(Color.RAINBOW)]
-        except ValueError:
-            return Color.RAINBOW[0]
+        hold_time = action.hold_time
 
-    def _prev_color(self, color):
-        # Compute the previous color in the rainbow
-        try:
-            index = Color.RAINBOW.index(color)
-            return Color.RAINBOW[(index - 1) % len(Color.RAINBOW)]
-        except ValueError:
-            return Color.RAINBOW[0]
+        if hold_time:
+            for i in range(5):
+                if self.button_ups[button] <= self.button_downs[button]:
+                    await self.set_lights([Color.RED] * (4-i) + [Color.GREEN] * i, brightness=.5)
+                    await asyncio.sleep(hold_time / 4000)
+                elif self.button_ups[button] - self.button_downs[button] <= hold_time:
+                    await self.do_fail_lights()
+                    break
+                else:
+                    break
+        else:
+            await self.do_ok_lights()
 
-    def next_setting(self):
-        # Sets the currently selected light to its next state
-        cur = self.light_settings[self.selected_light]
-        self.light_settings[self.selected_light] = self._next_color(cur)
+    async def do_ok_lights(self):
+        await self.set_lights(brightness=0)
+        await asyncio.sleep(.2)
+        await self.set_lights(color=Color.GREEN, brightness=.75)
+        await asyncio.sleep(.25)
+        await self.set_lights(color=Color.CYAN, brightness=.05)
 
-    def prev_setting(self):
-        # Sets the currently selected light to its previous state
-        cur = self.light_settings[self.selected_light]
-        self.light_settings[self.selected_light] = self._prev_color(cur)
+    async def do_fail_lights(self):
+        await self.set_lights(brightness=0)
+        await asyncio.sleep(.2)
+        await self.set_lights(color=Color.RED, brightness=.75)
+        await asyncio.sleep(.25)
+        await self.set_lights(color=Color.RED, brightness=.05)
+
+    async def button_press(self, button, timestamp):
+        print(button, 'press')
+        action = self.station.button_actions.get(button)
+
+        if action:
+            #self.button_ups[button] = 0
+            self.button_downs[button] = timestamp
+
+            if not action.hold_time:
+                print(self.station.name, action.message)
+                await Sender.send_message(self.station.name, action.message)
+
+            await self.do_progress_lights(button)
+
+    async def reset(self, action_button):
+        self.button_counts[action_button] = 0
+        self.button_downs[action_button] = 0
+        self.button_ups[action_button] = 0
+
+        if self.station:
+            action = self.station.button_actions.get(action_button)
+            if action:
+                self.flags.remove(action.message)
+
+    async def button_release(self, button, timestamp):
+        print(button, 'release')
+        action = self.station.button_actions.get(button)
+
+        if action and action.hold_time:
+            time_since_last = self.button_downs[button] - self.button_ups[button]
+            self.button_ups[button] = timestamp
+
+            held_time = timestamp - self.button_downs[button]
+
+            if held_time > action.hold_time:
+                if time_since_last > action.cooldown_time:
+                    self.button_counts[button] += 1
+
+                    await self.do_ok_lights()
+
+                    if self.button_counts[button] > action.message_after:
+                        await Sender.send_message(self.station.name, action.message)
+                    else:
+                        print(f"Need {action.message_after} presses to send message")
+
+                    if self.button_counts[button] > action.flag_after:
+                        self.flags.append(action.message)
+                    else:
+                        print(f"Need {action.flag_after} presses to set flag")
+
+                    await self.send_update()
+                else:
+                    print(f"Need to wait {action.cooldown_time} for another button press")
+                    await self.do_fail_lights()
+
+                print(self.station.name, action.message)
+            else:
+                print(f"No go, {held_time} < {action.hold_time}")
+                await self.do_fail_lights()
+
+    async def send_update(self):
+        self.component.publish('game.h2ops.station_updated', {
+            "id": str(self.badge_id),
+            "config": self.get_config()
+        })
+
+    async def set_lights(self, colors=None, color=Color.WHITE, brightness=.1):
+        # Set the lights for the badge to simple colors
+        if not colors:
+            colors = [color] * 4
+
+        # Note that the order of the lights will be [BOTTOM_LEFT, BOTTOM_RIGHT, TOP_RIGHT, TOP_LEFT]
+        self.component.publish('badge.' + str(self.badge_id) + '.lights_static',
+                               *(lighten(brightness, c) for c in colors))
 
 
 class GameComponent(ApplicationSession):
     players = {}
+    stations = {}
 
     def onConnect(self):
         """
@@ -192,11 +387,29 @@ class GameComponent(ApplicationSession):
             players = res.kwresults.get("players", [])
             await asyncio.gather(*(self.on_player_join(player) for player in players))
 
+    async def on_button_press(self, button, timestamp=0, badge_id=None):
+        """
+        Called when a button is pressed.
+        :param button:    The name of the button that was pressed
+        :param timestamp: The timestamp of the button press, in ms
+        :param badge_id:  The ID of the badge that pressed the button
+        :return: None
+        """
+
+        player = self.players.get(badge_id, None)
+
+        if not player:
+            print("Unknown player:", badge_id)
+            return
+
+        await player.button_press(button, timestamp)
+
     async def on_button_release(self, button, timestamp=0, badge_id=None):
         """
         Called when a button is released.
-        :param button:   The name of the button that was released
-        :param badge_id: The ID of the badge that released the button
+        :param button:    The name of the button that was released
+        :param timestamp: The timestamp of the button release, in ms
+        :param badge_id:  The ID of the badge that released the button
         :return: None
         """
 
@@ -207,44 +420,7 @@ class GameComponent(ApplicationSession):
             return
 
         # Do something with button released here
-
-    async def set_lights(self, player):
-        # Set the lights for the badge to simple colors
-        # Note that the order of the lights will be [BOTTOM_LEFT, BOTTOM_RIGHT, TOP_RIGHT, TOP_LEFT]
-        self.publish('badge.' + str(player.badge_id) + '.lights_static',
-                     *(lighten(player.brightness, c) for c in player.light_settings))
-
-                
-    async def on_button_press(self, button, timestamp=0, badge_id=None):
-        """
-        Called when a button is pressed.
-        :param button:   The name of the button that was pressed
-        :param badge_id: The ID of the badge that pressed the button
-        :return: None
-        """
-
-        player = self.players.get(badge_id, None)
-
-        if not player:
-            print("Unknown player:", badge_id)
-            return
-
-        if button == Button.UP:
-            player.next_setting()
-        elif button == Button.DOWN:
-            player.prev_setting()
-        elif button == Button.LEFT:
-            player.next_light()
-        elif button == Button.RIGHT:
-            player.prev_light()
-        elif button == Button.A:
-            player.brighter()
-        elif button == Button.B:
-            player.dimmer()
-        elif button == Button.SELECT:
-            self.publish('badge.' + str(badge_id) + '.text', 0, 0, 'You pressed select! Wow!', style=1)
-
-        await self.set_lights(player)
+        await player.button_release(button, timestamp)
 
     async def on_player_join(self, badge_id):
         """
@@ -261,15 +437,13 @@ class GameComponent(ApplicationSession):
 
         # If you want to listen for button releases too, un-comment this and add release_sub to
         # the list of subscriptions below
-        #release_sub = await self.subscribe(self.on_button_release, 'badge.' + str(badge_id) + '.button.release')
+        release_sub = await self.subscribe(self.on_button_release, 'badge.' + str(badge_id) + '.button.release')
 
         # Add an entry to keep track of the player's game-state
-        self.players[badge_id] = PlayerInfo(badge_id, subscriptions=[press_sub])
+        self.players[badge_id] = SwadgeInfo(badge_id, station=Station("test"),
+                                            component=self, subscriptions=[press_sub])
 
-        await self.set_lights(self.players[badge_id])
-
-        # Give the supporters a nice message on their screen
-        self.publish('badge.' + str(badge_id) + '.text', 0, 24, "THANK YOU for supporting us!", style=1)
+        await self.players[badge_id].set_lights(color=Color.GREEN)
 
     async def on_player_leave(self, badge_id):
         """
@@ -283,6 +457,25 @@ class GameComponent(ApplicationSession):
         await asyncio.gather(*(s.unsubscribe() for s in self.players[badge_id].subscriptions))
         del self.players[badge_id]
 
+    async def get_config(self):
+        return {
+            "players": [player.get_config() for player in self.players.values()],
+            "stations": {id: station.get_config() for id, station in self.stations.items()}
+        }
+
+    async def set_station(self, badge_id, station_id):
+        player = self.players.get(badge_id)
+
+        if not player:
+            return False
+
+        station = self.stations.get(station_id)
+
+        if not station:
+            return False
+
+        player.station = station
+
     async def onJoin(self, details):
         """
         WAMP calls this after successfully joining the realm.
@@ -294,6 +487,8 @@ class GameComponent(ApplicationSession):
         await self.subscribe(self.on_player_join, 'game.' + GAME_ID + '.player.join')
         await self.subscribe(self.on_player_leave, 'game.' + GAME_ID + '.player.leave')
         await self.subscribe(self.game_register, 'game.request_register')
+        await self.register(self.get_config, 'game.h2ops.get_config')
+        await self.register(self.set_station, 'game.h2ops.set_station')
         await self.game_register()
 
     def onDisconnect(self):
@@ -307,6 +502,15 @@ class GameComponent(ApplicationSession):
 if __name__ == '__main__':
     if GAME_ID == 'demo_game':
         print("Please change GAME_ID to something else!")
+        exit(1)
+
+    global settings
+
+    try:
+        with open('h2ops.conf') as f:
+            SETTINGS = json.load(f)
+    except:
+        print("Error! Could not find 'h2ops.conf'")
         exit(1)
 
     runner = ApplicationRunner(
